@@ -7,7 +7,7 @@
 #include <numeric>
 
 // OpenCV & ONNX Runtime Headers
-#include <opencv2/opencv.hpp>
+#include <opencv4/opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 
 // 추론 결과 구조체
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
     
     // 테스트할 이미지 파일 목록
     std::vector<std::string> test_images = {
-        "test1.jpg", "test2.jpg", "test3.jpg", "test4.jpg"
+        "apple.jpg", "orange.jpg", "test3.jpg", "test4.jpg"
     };
 
     // 1. ONNX Runtime 세션 설정 (Jetson Orin Nano CPU 최적화)
