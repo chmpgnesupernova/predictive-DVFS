@@ -47,9 +47,14 @@ void llmThreadFunc() {
         }
 
         std::cout << "[LLM Thread] Starting LLM Inference for: " << current_vision_result << "...\n";
-        std::string cmd = "sudo ./stateful-early-scaling -m ./Llama3.2" + current_vision_result + "' > /dev/null";
-        int ret = system(cmd.c_str());
-        (void)ret;
+        std::string cmd_start_llm = "sudo ./stateful-early-scaling -m ./Llama3.2" + current_vision_result + "' > /dev/null";
+        int ret1 = system(cmd_start_llm.c_str());
+        (void)ret1;
+        
+        std::string cmd_down_freq = "sudo echo userspace > /sys/class/devfreq/170000.gpu/governor \
+                                     sudo echo 306000000 > /sys/calss/devfreq/170000.gpu/userspace/set_freq";
+        int ret2 = system(cmd_down_freq.c_str());
+        (void)ret2;
         
         std::cout << "[LLM Thread] LLM Output Completed for " << current_vision_result << ".\n";
     }
