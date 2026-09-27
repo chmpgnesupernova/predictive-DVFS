@@ -7,57 +7,69 @@
 #include <atomic>
 #include <string>
 
-// --- FSM State 및 Predictive DVFS Controller ---
+/*
+ * class 에 1) hit_count, 2) miss_count 를 도입
+ * 
+ * 1) TAKEN state 의 경우:
+ *  miss_count < 20 일 경우 stay,
+ *  miss_count >= 20 일 경우 switch
+ *
+ * 2) NOT_TAKEN state 의 경우:
+ *  hit_count < 2 일 경우 stay,
+ *  hit_count >= 일 경우 switch
+ *  */
+
+
+// State 는 2 state 로 변경
 enum FSMState {
-    STRONGLY_NOT_TAKEN,
-    WEAKLY_NOT_TAKEN,
-    WEAKLY_TAKEN,
-    STRONGLY_TAKEN
+    TAKEN,
+    NOT_TAKEN
 };
 
 class PredictiveDVFS {
 private:
-    FSMState state = WEAKLY_TAKEN;
+    FSMState state = TAKEN;
     std::mutex mtx;
     bool early_scale = false;
+
+    int miss_count = 0;
+    int hit_count = 0;
 
     void update(bool is_hit) {
         if (is_hit) {
             switch (state) {
-                case STRONGLY_NOT_TAKEN: state = WEAKLY_NOT_TAKEN; break;
-                case WEAKLY_NOT_TAKEN:   state = WEAKLY_TAKEN; break;
-                case WEAKLY_TAKEN:       state = STRONGLY_TAKEN; break;
-                case STRONGLY_TAKEN:     state = STRONGLY_TAKEN; break;
+                case TAKEN:     miss_count = 0; state = TAKEN; break;
+                case NOT_TAKEN: (++hit_count < 2) ? state = NOT_TAKEN : state = TAKEN; break;
             }
-            std::cout << "[FSM] Update: Hit (LLM Request) -> New State: " << stateToString(state) << "\n";
         } else {
             switch (state) {
-                case STRONGLY_TAKEN:     state = WEAKLY_TAKEN; break;
-                case WEAKLY_TAKEN:       state = WEAKLY_NOT_TAKEN; break;
-                case WEAKLY_NOT_TAKEN:   state = STRONGLY_NOT_TAKEN; break;
-                case STRONGLY_TAKEN:     state = STRONGLY_NOT_TAKEN; break;
+                case TAKEN:     (++miss_count < 20) ? state = TAKEN : state = NOT_TAKEN; break;
+                case NOT_TAKEN: hit_count = 0; state = NOT_TAKEN; break;
             }
-            std::cout << "[FSM] Update: Miss (No Request) -> New State: " << stateToString(state) << "\n";
         }
     }
 
     std::string stateToString(FSMState s) {
         switch (s) {
-            case STRONGLY_NOT_TAKEN: return "Strongly Not Taken";
-            case WEAKLY_NOT_TAKEN:   return "Weakly Not Taken";
-            case WEAKLY_TAKEN:       return "Weakly Taken";
-            case STRONGLY_TAKEN:     return "Strongly Taken";
-            default: return "Unknown";
+            case TAKEN:         return "TAKEN";
+            case NOT_TAKEN:     return "NOT_TAKEN";
+            default:            return "UNKNOWN";
         }
     }
 
 public:
     void scaleFrequencyEarly() {
         std::lock_guard<std::mutex> lock(mtx);
-        if (state == STRONGLY_TAKEN || state == WEAKLY_TAKEN) {
+        if (state == TAKEN) {
+            // DVFS start, scale freq
+            std::string cmd = "sudo echo userspace > /sys/class/devfreq/170000.gpu/governor \
+                               sudo echo 624750000 > /sys/calss/devfreq/170000.gpu/userspace/set_freq";
+            int ret = system(cmd.c_str());
+            (void)ret;
             early_scale = true;
-            std::cout << "[DVFS] Early Scaling Triggered (Predictive). Scaling asynchronously...\n";
+
         } else {
+            // already low freq
             early_scale = false;
         }
     }
@@ -66,15 +78,21 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
         
         if (!early_scale && is_hit) {
-            std::cout << "[DVFS] Reactive Scaling Triggered. 15ms overhead penalty applied!\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(15)); 
-            std::cout << "[DVFS] GPU Frequency is now HIGH.\n";
-        } else if (early_scale && is_hit) {
-            std::cout << "[DVFS] GPU Frequency is already HIGH (15ms Latency Hidden).\n";
+            // DVFS start, scale freq
+            std::string cmd = "sudo echo userspace > /sys/class/devfreq/170000.gpu/governor \
+                               sudo echo 624750000 > /sys/calss/devfreq/170000.gpu/userspace/set_freq";
+            int ret = system(cmd.c_str());
+            (void)ret;
+
         } else if (early_scale && !is_hit) {
-            std::cout << "[DVFS] False Alarm: Scaled but no LLM request (Energy penalty).\n";
+            // DVFS start, False alram, down freq
+            std::string cmd = "sudo echo userspace > /sys/class/devfreq/170000.gpu/governor \
+                               sudo echo 306000000 > /sys/calss/devfreq/170000.gpu/userspace/set_freq";
+            int ret = system(cmd.c_str());
+            (void)ret;
         }
-        
+        // early_scale && is_hit 의 경우와 !early_scale && !is_hit 경우는 skip.
+
         update(is_hit);
     }
 };

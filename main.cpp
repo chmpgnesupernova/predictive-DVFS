@@ -11,6 +11,22 @@
 #include "vision_inference.h"
 #include "predictive_dvfs_class.h"
 
+#define TARGET_FPS 20
+#define TIME_SLOT_SEC 60
+#define TIME_SLOT_NUM 10
+
+// 슬롯 별 테스트용 프레임 이미지 리스트 
+std::vector<std::string> image_slot = {
+    "orange.jpg", "apple.jpg", "orange.jpg", "apple.jpg",
+    "orange.jpg", "apple.jpg", "orange.jpg", "apple.jpg",
+    "orange.jpg", "apple.jpg"
+};
+
+std::map<int, std::string> class_map = {
+    {948, "apple"},
+    {950, "orange"}
+};
+
 // global
 PredictiveDVFS dvfsController;
 std::queue<std::string> llm_task_queue;
@@ -19,11 +35,20 @@ std::condition_variable llm_cv;
 std::atomic<bool> system_running(true);
 
 // Robot Middleware 
+auto interval_start = std::chrono::steady_clock::now();
+auto interval_end = std::chrono::steady_clock::now();
+
 bool robotMiddleware(const std::string& vision_output) {
     std::cout << "[Middleware] Received Vision Output: '" << vision_output << "'\n";
+    interval_end = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(interval_end - interval_start).count();
 
-    if (vision_output == "apple" || vision_output == "orange") {
+    // interval 이 1초 이므로 1초 되기 전까지는 false, 첫 루프는 음수이므로 통과
+    if (0 < elapsed && elapsed < 1000) { return false; } 
+    
+    if (vision_output == "apple") {
         std::cout << "[Middleware] Target Object detected! Decided to request LLM.\n";
+        interval_start = std::chrono::steady_clock::now();
         return true;
     }
     
@@ -62,9 +87,9 @@ void llmThreadFunc() {
 
 // Vision Thread
 void visionThreadFunc() {
-    const int target_fps = 20;
-    const int frame_duration_ms = 1000 / target_fps; // 50ms
-    
+    const int frame_duration_ms = 1000 / TARGET_FPS; // 50ms
+    const int total_frame = TIME_SLOT_NUM * TIME_SLOT_SEC * TARGET_FPS;
+
     // 1. ONNX Runtime 초기화 및 세션 로드 (루프 외부에서 1회만 실행)
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "VisionInference");
     Ort::SessionOptions session_options;
@@ -77,33 +102,19 @@ void visionThreadFunc() {
     
     Ort::Session session(env, model_path.c_str(), session_options);
 
-    // 테스트용 프레임 이미지 리스트 
-    std::vector<std::string> frame_images = {
-        "test1.jpg", "test2.jpg", "test3.jpg", "test4.jpg"
-    };
-
-    // (옵션) ImageNet Class ID를 문자열로 매핑하기 위한 간단한 딕셔너리
-    // 실제 ImageNet 기준: 사과(948), 오렌지(950), 바나나(954)
-    std::map<int, std::string> class_map = {
-        {948, "apple"},
-        {950, "orange"},
-        {954, "banana"}
-    };
-
-    for (size_t frame_count = 0; frame_count < frame_images.size(); ++frame_count) {
+    for (size_t frame_count = 0; frame_count < total_frame; ++frame_count) {
         auto start_time = std::chrono::steady_clock::now();
         std::cout << "\n=== Processing Frame " << (frame_count + 1) << " ===\n";
-
+       
+        // slot 의 이미지를 선택
+        int cur_slot = frame_count / (SLOT_SEC * TARGET_FPS); // slot 당 1200 frame
+        std::string img = image_slot[cur_slot];
+        
         // Early Scaling
         dvfsController.scaleFrequencyEarly();
-
-        /*
-         * runMobileNetInference 함수 사용하여 vision_output 생성
-         */
-        std::cout << "[Vision Thread] Running inference on " << frame_images[frame_count] << "...\n";
         
         InferenceResult result = runMobileNetInference(
-            frame_images[frame_count], session, input_node_name, output_node_name
+            img, session, input_node_name, output_node_name
         );
         
         std::string vision_output;
