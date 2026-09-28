@@ -22,9 +22,8 @@
  *  HOLD : interval(1s) 진행 중인 프레임 -> FSM 카운터 변화 없음 (현재 상태 유지)
  *  MISS : interval 밖에서 target 미검출 -> miss 로 카운트
  *  */
-
 // 보드에 맞게 확인할 것: ls /sys/class/devfreq/
-#define GPU_DEVFREQ_PATH "/sys/class/devfreq/170000.gpu"
+#define GPU_DEVFREQ_PATH "/sys/class/devfreq/17000000.gpu"
 
 /*
  * GPU 주파수 제어 (sysfs 직접 쓰기, root 권한 필요 -> sudo ./main 으로 실행)

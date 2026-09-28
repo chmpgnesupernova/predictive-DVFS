@@ -1,3 +1,5 @@
 tmp/
 models/Llama*
 models/mobilenet*
+build.sh
+motion-plan

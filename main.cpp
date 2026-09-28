@@ -24,8 +24,8 @@
 #define RING_BUFFER_SIZE 8
 
 // LLM 자식 프로세스 설정
-static const char* MOTION_PLAN_BIN = "./models/motion-plan";
-static const char* LLM_MODEL_PATH  = "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+static const char* MOTION_PLAN_BIN = "./motion-plan";
+static const char* LLM_MODEL_PATH  = "./models/Llama-3.2-1B-Instruction-Q4_K_M.gguf";
 
 // motion-plan.cpp 와 동일해야 하는 프로토콜 마커
 static const char* LLM_READY_MARKER = "<<MOTION_PLAN_READY>>";

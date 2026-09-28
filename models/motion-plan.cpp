@@ -22,8 +22,8 @@ static const char * END_MARKER   = "<<MOTION_PLAN_END>>";
 
 static const char * SYSTEM_PROMPT =
     "You are a motion planner for a robot arm. "
-    "Given the name of a detected object, output a short, numbered list of "
-    "primitive actions (e.g. move_to, grasp, lift, place) to pick it up.";
+    "input will be 'apple' or 'orange'"
+    "your response must be in this form: {state: YOUR_CURRENT_STATE, action: YOUR_PLANNED_ACTION}";
 
 static void print_usage(int, char ** argv) {
     fprintf(stderr, "\nexample usage:\n");
@@ -37,7 +37,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     int ngl       = 99;
     int n_ctx     = 2048;
-    int n_predict = 256;   // 응답 길이 상한
+    int n_predict = 10;   // 응답 길이 상한
 
     // parse command line arguments
     for (int i = 1; i < argc; i++) {
