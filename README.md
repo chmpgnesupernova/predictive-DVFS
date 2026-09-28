@@ -3,4 +3,6 @@
 2. predictive_dvfs_class.h : DVFS 컨트롤러 클래스
 3. vision_inference.h : 비전 추론, onnx runtime 함수 
 
+# 변경사항
+09.28
 
