@@ -72,7 +72,7 @@ void llmThreadFunc() {
         }
 
         std::cout << "[LLM Thread] Starting LLM Inference for: " << current_vision_result << "...\n";
-        std::string cmd_start_llm = "sudo ./stateful-early-scaling -m ./Llama3.2" + current_vision_result + "' > /dev/null";
+        std::string cmd_start_llm = "sudo ./simple-chat -m ./Llama-3.2-1B-Instruction-Q4_K_M.gguf" + current_vision_result + "";
         int ret1 = system(cmd_start_llm.c_str());
         (void)ret1;
         
