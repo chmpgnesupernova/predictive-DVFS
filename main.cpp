@@ -25,7 +25,7 @@
 #define TARGET_FPS 20
 #endif
 #ifndef TIME_SLOT_SEC
-#define TIME_SLOT_SEC 60
+#define TIME_SLOT_SEC 10
 #endif
 #ifndef TIME_SLOT_NUM
 #define TIME_SLOT_NUM 10
@@ -71,17 +71,14 @@ PredictiveDVFS dvfsController;
 RingBuffer<LlmRequest, RING_BUFFER_SIZE> vision_ring;
 
 // LLM 통계 (LLM thread 에서만 갱신, 종료 후 main 에서 읽음)
+// chmpnov:
+// LLM 소요 시간의 최소,최대를 구하는 이유가 잘 없다. 그래도 남겨둠.
 struct LlmStats {
     int count = 0;
     double sum_ms = 0.0, min_ms = 1e18, max_ms = 0.0;
     double sum_wait_ms = 0.0;
 } llm_stats;
 
-// ---------------------------------------------------------------------------
-// LLM 자식 프로세스 (motion-plan) 래퍼
-//   parent --(stdin pipe)--> motion-plan : 한 줄 = 요청 1건 (vision 결과)
-//   parent <--(stdout pipe)-- motion-plan : 응답 ... LLM_END_MARKER
-// ---------------------------------------------------------------------------
 class LlmProcess {
 public:
     bool start(const std::vector<std::string>& argv) {
@@ -369,9 +366,9 @@ void visionThreadFunc() {
 }
 
 int main() {
-    // 자식 프로세스가 죽은 뒤 pipe 에 쓰면 SIGPIPE 로 전체가 종료되는 것을 방지
     signal(SIGPIPE, SIG_IGN);
-
+    
+    // Logger
     if (!Log::open()) {
         std::cerr << "cannot open log file " << DVFS_LOG_PATH << "\n";
         return 1;
@@ -380,12 +377,13 @@ int main() {
                std::to_string(PredictiveDVFS::MISS_THRESHOLD) + ", HIT_THRESHOLD=" +
                std::to_string(PredictiveDVFS::HIT_THRESHOLD) + ", log=" DVFS_LOG_PATH ")");
 
+    // GpuFreq init
     if (!GpuFreq::init()) {
         std::cerr << "GPU DVFS init failed. Run with sudo and check " GPU_DEVFREQ_PATH "\n";
         return 1;
     }
 
-    // 쓰레드 생성 전에 fork (멀티쓰레드 상태에서의 fork 회피) + 모델 로드 완료 대기
+    // llama.cpp binary init
     LlmProcess llm;
     if (!llm.start({MOTION_PLAN_BIN, "-m", LLM_MODEL_PATH})) {
         std::cerr << "Failed to start motion-plan process.\n";
@@ -393,6 +391,7 @@ int main() {
         return 1;
     }
 
+    // 2 threads init
     std::thread llm_thread(llmThreadFunc, std::ref(llm));
     std::thread vision_thread(visionThreadFunc);
 
@@ -402,7 +401,7 @@ int main() {
     llm.stop();
     GpuFreq::releaseAll();
 
-    // 최종 요약
+    // Logger
     auto s = dvfsController.snapshot();
     auto c = GpuFreq::totalCounters();
     char buf[400];

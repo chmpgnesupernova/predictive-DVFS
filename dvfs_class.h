@@ -33,10 +33,12 @@
 
 // 보드에 맞게 확인할 것: ls /sys/class/devfreq/
 #ifndef GPU_DEVFREQ_PATH
-#define GPU_DEVFREQ_PATH "/sys/class/devfreq/170000.gpu"
+#define GPU_DEVFREQ_PATH "/sys/class/devfreq/17000000.gpu"
 #endif
 
 // 주파수 변경 원인
+// chmpnov:
+// Reason 을 추가한 이유는? 필요한가?
 enum class FreqReason {
     INIT,              // 시작 시 LOW 로 초기화
     EARLY_UP,          // TAKEN: 비전 추론 시작과 동시에 선제적 up        (매 프레임 반복 → 파일만)
