@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <functional>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
@@ -15,17 +17,30 @@
 #include <sys/wait.h>
 
 #include "vision.h"
+#include "logger.h"
 #include "dvfs_class.h"
 #include "ring_buffer.h"
 
+#ifndef TARGET_FPS
 #define TARGET_FPS 20
+#endif
+#ifndef TIME_SLOT_SEC
 #define TIME_SLOT_SEC 60
+#endif
+#ifndef TIME_SLOT_NUM
 #define TIME_SLOT_NUM 10
+#endif
 #define RING_BUFFER_SIZE 8
+#define REQUEST_INTERVAL_MS 1000      // LLM request 주기 (1초에 1번)
+#define VISION_LOG_EVERY 100          // vision 요약 로그 주기 (100 프레임 = 5초)
 
 // LLM 자식 프로세스 설정
-static const char* MOTION_PLAN_BIN = "./models/motion-plan";
-static const char* LLM_MODEL_PATH  = "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+#ifndef MOTION_PLAN_BIN
+#define MOTION_PLAN_BIN "./models/motion-plan"
+#endif
+#ifndef LLM_MODEL_PATH
+#define LLM_MODEL_PATH "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+#endif
 
 // motion-plan.cpp 와 동일해야 하는 프로토콜 마커
 static const char* LLM_READY_MARKER = "<<MOTION_PLAN_READY>>";
@@ -43,9 +58,24 @@ std::map<int, std::string> class_map = {
     {950, "orange"}
 };
 
+// Vision -> LLM 요청 1건
+struct LlmRequest {
+    int id = 0;
+    int frame = 0;
+    double push_ms = 0.0;      // ring buffer push 시각
+    std::string input;         // vision 결과
+};
+
 // global
 PredictiveDVFS dvfsController;
-RingBuffer<std::string, RING_BUFFER_SIZE> vision_ring;
+RingBuffer<LlmRequest, RING_BUFFER_SIZE> vision_ring;
+
+// LLM 통계 (LLM thread 에서만 갱신, 종료 후 main 에서 읽음)
+struct LlmStats {
+    int count = 0;
+    double sum_ms = 0.0, min_ms = 1e18, max_ms = 0.0;
+    double sum_wait_ms = 0.0;
+} llm_stats;
 
 // ---------------------------------------------------------------------------
 // LLM 자식 프로세스 (motion-plan) 래퍼
@@ -61,7 +91,6 @@ public:
             return false;
         }
 
-        // exec 인자는 fork 전에 준비 (fork 이후 child 에서는 exec 만 수행)
         std::vector<char*> args;
         for (const auto& s : argv) args.push_back(const_cast<char*>(s.c_str()));
         args.push_back(nullptr);
@@ -83,7 +112,6 @@ public:
             _exit(127);
         }
 
-        // parent
         close(in_pipe[0]);
         close(out_pipe[1]);
         to_child_   = fdopen(in_pipe[1], "w");
@@ -93,24 +121,31 @@ public:
             return false;
         }
 
-        // 모델 로드 완료 대기
-        std::cout << "[LLM] Waiting for motion-plan to load model...\n";
-        return readUntil(LLM_READY_MARKER, nullptr);
+        Log::event("LLM", "waiting for motion-plan to load model...");
+        double t0 = Log::nowMs();
+        bool ok = readUntil(LLM_READY_MARKER, nullptr, nullptr);
+        if (ok) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "motion-plan ready (model load %.0f ms)", Log::nowMs() - t0);
+            Log::event("LLM", buf);
+        }
+        return ok;
     }
 
-    // 요청 1건 전송 후 응답이 끝날 때까지 block
-    bool request(const std::string& input, std::string& response) {
+    // 요청 1건 전송 후 LLM_END_MARKER 까지 block.
+    // on_end 는 마커를 읽은 즉시(응답 후처리 전에) 호출된다.
+    bool request(const std::string& input, std::string& response, const std::function<void()>& on_end) {
         if (fprintf(to_child_, "%s\n", input.c_str()) < 0 || fflush(to_child_) != 0) {
             return false;
         }
-        return readUntil(LLM_END_MARKER, &response);
+        return readUntil(LLM_END_MARKER, &response, &on_end);
     }
 
     void stop() {
         if (to_child_)   { fclose(to_child_);   to_child_ = nullptr; }   // EOF -> child 종료
         if (from_child_) {
             char buf[256];
-            while (fgets(buf, sizeof(buf), from_child_)) {}               // 잔여 출력 drain
+            while (fgets(buf, sizeof(buf), from_child_)) {}
             fclose(from_child_);
             from_child_ = nullptr;
         }
@@ -122,7 +157,7 @@ public:
     }
 
 private:
-    bool readUntil(const std::string& marker, std::string* out) {
+    bool readUntil(const std::string& marker, std::string* out, const std::function<void()>* on_end) {
         char* line = nullptr;
         size_t cap = 0;
         ssize_t n;
@@ -131,11 +166,11 @@ private:
             while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 
             if (s == marker) {
+                if (on_end && *on_end) (*on_end)();   // 마커 수신 즉시 (GPU down)
                 free(line);
                 return true;
             }
             if (out) { *out += s; *out += '\n'; }
-            if (!s.empty()) std::cout << "[LLM] " << s << "\n";
         }
         free(line);
         return false;   // child 종료 (EOF)
@@ -146,89 +181,118 @@ private:
     FILE* from_child_ = nullptr;
 };
 
+// ---------------------------------------------------------------------------
 // Robot Middleware
-#define REQUEST_INTERVAL_MS 1000
-static std::chrono::steady_clock::time_point interval_start;
-static bool interval_active = false;   // 첫 HIT 이전에는 interval 없음
+//   1초에 1번 LLM request 를 발생시킨다 (target object 가 보일 때).
+//   request 한 프레임 = HIT, 나머지 프레임 = MISS.
+// ---------------------------------------------------------------------------
+static std::chrono::steady_clock::time_point last_request_time;
+static bool has_requested = false;
 
-Decision robotMiddleware(const std::string& vision_output) {
-    std::cout << "[Middleware] Received Vision Output: '" << vision_output << "'\n";
+bool robotMiddleware(const std::string& vision_output) {
     auto now = std::chrono::steady_clock::now();
 
-    // interval(1s) 진행 중: HOLD (miss 로 세지 않음)
-    if (interval_active) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - interval_start).count();
-        if (elapsed < REQUEST_INTERVAL_MS) {
-            std::cout << "[Middleware] In request interval (" << elapsed << " ms). HOLD.\n";
-            return Decision::HOLD;
-        }
-        interval_active = false;   // interval 종료, 이후 프레임부터 HIT/MISS 판정
+    if (has_requested) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_request_time).count();
+        if (elapsed < REQUEST_INTERVAL_MS) return false;
     }
 
     if (vision_output == "apple") {
-        std::cout << "[Middleware] Target Object detected! Decided to request LLM.\n";
-        interval_start = now;
-        interval_active = true;
-        return Decision::HIT;
+        last_request_time = now;
+        has_requested = true;
+        return true;
     }
-
-    std::cout << "[Middleware] Non-target object. No LLM request. MISS.\n";
-    return Decision::MISS;
+    return false;
 }
 
+// ---------------------------------------------------------------------------
 // LLM Thread
+// ---------------------------------------------------------------------------
+static std::string trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
+}
+
 void llmThreadFunc(LlmProcess& llm) {
-    std::string current_vision_result;
+    LlmRequest req;
 
     // close() 후 버퍼가 비면 pop 이 false 를 반환하며 종료
-    while (vision_ring.pop(current_vision_result)) {
-        std::cout << "[LLM Thread] Starting LLM Inference for: " << current_vision_result << "...\n";
+    while (vision_ring.pop(req)) {
+        const double start_ms = Log::nowMs();
+        const double wait_ms  = start_ms - req.push_ms;
 
-        auto t0 = std::chrono::steady_clock::now();
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "START #%d input='%s' frame=%d queue_wait=%.1fms gpu=%s",
+                      req.id, req.input.c_str(), req.frame, wait_ms,
+                      GpuFreq::mhz(GpuFreq::current()).c_str());
+        Log::eventAt(start_ms, "LLM", buf);
+
+        double end_ms = 0.0;
         std::string response;
-        bool ok = llm.request(current_vision_result, response);
-        auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - t0).count();
-
-        // 요청 1건 종료: 남은 요청이 없으면 GPU LOW 로 down-scaling
-        GpuFreq::release();
+        bool ok = llm.request(req.input, response, [&] {
+            end_ms = Log::nowMs();
+            GpuFreq::release();          // LLM_END_MARKER 수신 즉시 GPU LOW
+        });
 
         if (!ok) {
-            std::cerr << "[LLM Thread] motion-plan process terminated unexpectedly.\n";
+            Log::event("ERROR", "motion-plan process terminated unexpectedly");
             vision_ring.close();
             GpuFreq::releaseAll();
             break;
         }
 
-        std::cout << "[LLM Thread] LLM Output Completed for " << current_vision_result
-                  << " (" << llm_ms << " ms)\n";
+        const double llm_ms   = end_ms - start_ms;           // LLM 동작 시간
+        const double total_ms = end_ms - req.push_ms;        // request -> 응답 완료
+
+        llm_stats.count++;
+        llm_stats.sum_ms += llm_ms;
+        llm_stats.min_ms = std::min(llm_stats.min_ms, llm_ms);
+        llm_stats.max_ms = std::max(llm_stats.max_ms, llm_ms);
+        llm_stats.sum_wait_ms += wait_ms;
+
+        std::snprintf(buf, sizeof(buf), "END   #%d llm_time=%.1fms (request->end %.1fms)",
+                      req.id, llm_ms, total_ms);
+        Log::eventAt(end_ms, "LLM", buf);
+
+        Log::block("LLM_OUTPUT", "#" + std::to_string(req.id) + " '" + req.input + "'", trim(response));
     }
 }
 
+// ---------------------------------------------------------------------------
 // Vision Thread
+// ---------------------------------------------------------------------------
 void visionThreadFunc() {
     const int frame_duration_ms = 1000 / TARGET_FPS; // 50ms
     const int total_frame = TIME_SLOT_NUM * TIME_SLOT_SEC * TARGET_FPS;
+    const int frames_per_slot = TIME_SLOT_SEC * TARGET_FPS;
 
-    // 1. ONNX Runtime 초기화 및 세션 로드 (루프 외부에서 1회만 실행)
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "VisionInference");
     Ort::SessionOptions session_options;
     session_options.SetIntraOpNumThreads(6); // Jetson CPU 코어 최적화
 
-    // 모델 경로와 입출력 노드 이름 설정
     const std::string model_path = "./models/mobilenetv2.onnx";
     const char* input_node_name = "input";
     const char* output_node_name = "output";
 
     Ort::Session session(env, model_path.c_str(), session_options);
 
+    // 100 프레임 요약용
+    double win_lat_sum = 0.0, win_lat_max = 0.0;
+    int win_frames = 0, win_requests = 0, win_overruns = 0;
+    std::string last_detect;
+    float last_score = 0.0f;
+    int request_id = 0;
+
     for (int frame_count = 0; frame_count < total_frame; ++frame_count) {
         auto start_time = std::chrono::steady_clock::now();
-        std::cout << "\n=== Processing Frame " << (frame_count + 1) << " ===\n";
 
-        // slot 의 이미지를 선택
-        int cur_slot = frame_count / (TIME_SLOT_SEC * TARGET_FPS); // slot 당 1200 frame
-        std::string img = image_slot[cur_slot];
+        int cur_slot = frame_count / frames_per_slot;
+        const std::string& img = image_slot[cur_slot % image_slot.size()];
+        if (frame_count % frames_per_slot == 0) {
+            Log::event("SLOT", "slot " + std::to_string(cur_slot) + " start: " + img +
+                       " (frame " + std::to_string(frame_count) + ")");
+        }
 
         // Early Scaling
         dvfsController.scaleFrequencyEarly();
@@ -241,35 +305,61 @@ void visionThreadFunc() {
         if (result.class_id == -1) {
             vision_output = "none"; // 이미지 로드 실패 등 예외 처리
         } else {
-            // ID를 문자열로 매핑. 맵에 없는 경우 "object_아이디" 형태로 변환
-            if (class_map.find(result.class_id) != class_map.end()) {
-                vision_output = class_map[result.class_id];
-            } else {
-                vision_output = "object_" + std::to_string(result.class_id);
-            }
-            std::cout << "[Vision Thread] Inference Latency: " << result.inference_time_ms << " ms\n";
-            std::cout << "[Vision Thread] Detected: " << vision_output << " (Score: " << result.confidence << ")\n";
+            auto it = class_map.find(result.class_id);
+            vision_output = (it != class_map.end()) ? it->second
+                                                    : "object_" + std::to_string(result.class_id);
         }
+        last_detect = vision_output;
+        last_score = result.confidence;
+        win_lat_sum += result.inference_time_ms;
+        win_lat_max = std::max(win_lat_max, result.inference_time_ms);
 
-        // Middleware 판단 (HIT / MISS / HOLD)
-        Decision decision = robotMiddleware(vision_output);
+        // Middleware 판단 (request 했으면 HIT, 아니면 MISS)
+        bool is_hit = robotMiddleware(vision_output);
 
-        // Reactive Scaling & State 업데이트
-        dvfsController.scaleFrequencyReactive(decision);
+        // Reactive Scaling & FSM 업데이트
+        dvfsController.scaleFrequencyReactive(is_hit);
 
         // Ring buffer 를 이용한 LLM 데이터 전달
-        if (decision == Decision::HIT) {
-            PushResult r = vision_ring.push(vision_output);
-            if (r == PushResult::Accepted) {
-                GpuFreq::acquire();   // 처리 완료 전까지 GPU down-scaling 방지
-            } else if (r == PushResult::Overwrote) {
-                std::cout << "[Vision Thread] Ring buffer full, oldest request dropped.\n";
+        if (is_hit) {
+            ++win_requests;
+            LlmRequest req{++request_id, frame_count, Log::nowMs(), vision_output};
+            GpuFreq::acquire();                     // 응답 완료 전까지 GPU down-scaling 방지
+            PushResult r = vision_ring.push(req);
+            if (r != PushResult::Accepted) {
+                GpuFreq::cancelAcquire();
+                if (r == PushResult::Overwrote) {
+                    Log::event("RING", "buffer full, oldest request dropped (request #" +
+                               std::to_string(req.id) + ")");
+                }
             }
         }
 
         // 20FPS 유지를 위한 보정
         auto end_time = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        if (elapsed > frame_duration_ms) ++win_overruns;
+        ++win_frames;
+
+        // 100 프레임(5초)마다 1회 요약
+        if ((frame_count + 1) % VISION_LOG_EVERY == 0 || frame_count + 1 == total_frame) {
+            auto s = dvfsController.snapshot();
+            auto c = GpuFreq::takeWindowCounters();
+            char buf[400];
+            std::snprintf(buf, sizeof(buf),
+                "frames %d-%d  detect='%s'(%.2f)  vision_lat avg=%.1fms max=%.1fms  overrun=%d  "
+                "requests=%d  | state=%s miss_count=%d hit_count=%d  "
+                "| freq up=%d(early %d) down=%d(false_alarm %d) gpu=%s  ring=%zu",
+                frame_count + 1 - win_frames, frame_count, last_detect.c_str(), last_score,
+                win_lat_sum / win_frames, win_lat_max, win_overruns, win_requests,
+                stateToString(s.state), s.miss_count, s.hit_count,
+                c.up, c.early_up, c.down, c.false_alarm_down,
+                GpuFreq::mhz(GpuFreq::current()).c_str(), vision_ring.size());
+            Log::event("VISION", buf);
+            win_lat_sum = win_lat_max = 0.0;
+            win_frames = win_requests = win_overruns = 0;
+        }
+
         if (elapsed < frame_duration_ms) {
             std::this_thread::sleep_for(std::chrono::milliseconds(frame_duration_ms - elapsed));
         }
@@ -279,10 +369,16 @@ void visionThreadFunc() {
 }
 
 int main() {
-    std::cout << "Starting VLA Predictive-DVFS Framework...\n";
-
     // 자식 프로세스가 죽은 뒤 pipe 에 쓰면 SIGPIPE 로 전체가 종료되는 것을 방지
     signal(SIGPIPE, SIG_IGN);
+
+    if (!Log::open()) {
+        std::cerr << "cannot open log file " << DVFS_LOG_PATH << "\n";
+        return 1;
+    }
+    Log::event("SYSTEM", "Starting VLA Predictive-DVFS Framework (MISS_THRESHOLD=" +
+               std::to_string(PredictiveDVFS::MISS_THRESHOLD) + ", HIT_THRESHOLD=" +
+               std::to_string(PredictiveDVFS::HIT_THRESHOLD) + ", log=" DVFS_LOG_PATH ")");
 
     if (!GpuFreq::init()) {
         std::cerr << "GPU DVFS init failed. Run with sudo and check " GPU_DEVFREQ_PATH "\n";
@@ -306,7 +402,23 @@ int main() {
     llm.stop();
     GpuFreq::releaseAll();
 
-    std::cout << "Dropped LLM requests (ring buffer overwrite): " << vision_ring.dropped() << "\n";
-    std::cout << "System Terminated.\n";
+    // 최종 요약
+    auto s = dvfsController.snapshot();
+    auto c = GpuFreq::totalCounters();
+    char buf[400];
+    std::snprintf(buf, sizeof(buf),
+        "LLM requests=%d  llm_time avg=%.1fms min=%.1fms max=%.1fms  queue_wait avg=%.1fms  dropped=%zu",
+        llm_stats.count,
+        llm_stats.count ? llm_stats.sum_ms / llm_stats.count : 0.0,
+        llm_stats.count ? llm_stats.min_ms : 0.0, llm_stats.max_ms,
+        llm_stats.count ? llm_stats.sum_wait_ms / llm_stats.count : 0.0,
+        vision_ring.dropped());
+    Log::event("SUMMARY", buf);
+    std::snprintf(buf, sizeof(buf),
+        "freq up=%d (early %d) down=%d (false_alarm %d)  FSM transitions=%d  final state=%s",
+        c.up, c.early_up, c.down, c.false_alarm_down, s.transitions, stateToString(s.state));
+    Log::event("SUMMARY", buf);
+    Log::event("SYSTEM", "System Terminated.");
+    Log::close();
     return 0;
 }
