@@ -20,12 +20,13 @@
 #include "logger.h"
 #include "dvfs_class.h"
 #include "ring_buffer.h"
+#include "power.h"
 
 #ifndef TARGET_FPS
 #define TARGET_FPS 20
 #endif
 #ifndef TIME_SLOT_SEC
-#define TIME_SLOT_SEC 10
+#define TIME_SLOT_SEC 60
 #endif
 #ifndef TIME_SLOT_NUM
 #define TIME_SLOT_NUM 10
@@ -36,10 +37,10 @@
 
 // LLM 자식 프로세스 설정
 #ifndef MOTION_PLAN_BIN
-#define MOTION_PLAN_BIN "./models/motion-plan"
+#define MOTION_PLAN_BIN "./motion-plan"
 #endif
 #ifndef LLM_MODEL_PATH
-#define LLM_MODEL_PATH "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+#define LLM_MODEL_PATH "./models/Llama-3.2-1B-Instruction-Q4_K_M.gguf"
 #endif
 
 // motion-plan.cpp 와 동일해야 하는 프로토콜 마커
@@ -67,18 +68,22 @@ struct LlmRequest {
 };
 
 // global
+DvfsMode g_mode = DvfsMode::PREDICTIVE;
 PredictiveDVFS dvfsController;
 RingBuffer<LlmRequest, RING_BUFFER_SIZE> vision_ring;
 
 // LLM 통계 (LLM thread 에서만 갱신, 종료 후 main 에서 읽음)
-// chmpnov:
-// LLM 소요 시간의 최소,최대를 구하는 이유가 잘 없다. 그래도 남겨둠.
 struct LlmStats {
     int count = 0;
     double sum_ms = 0.0, min_ms = 1e18, max_ms = 0.0;
     double sum_wait_ms = 0.0;
 } llm_stats;
 
+// ---------------------------------------------------------------------------
+// LLM 자식 프로세스 (motion-plan) 래퍼
+//   parent --(stdin pipe)--> motion-plan : 한 줄 = 요청 1건 (vision 결과)
+//   parent <--(stdout pipe)-- motion-plan : 응답 ... LLM_END_MARKER
+// ---------------------------------------------------------------------------
 class LlmProcess {
 public:
     bool start(const std::vector<std::string>& argv) {
@@ -276,6 +281,8 @@ void visionThreadFunc() {
 
     // 100 프레임 요약용
     double win_lat_sum = 0.0, win_lat_max = 0.0;
+    double win_energy_start_uJ = power_energy_now_uJ();
+    double win_start_ms = Log::nowMs();
     int win_frames = 0, win_requests = 0, win_overruns = 0;
     std::string last_detect;
     float last_score = 0.0f;
@@ -342,16 +349,29 @@ void visionThreadFunc() {
         if ((frame_count + 1) % VISION_LOG_EVERY == 0 || frame_count + 1 == total_frame) {
             auto s = dvfsController.snapshot();
             auto c = GpuFreq::takeWindowCounters();
-            char buf[400];
+            char fsm_buf[80];
+            if (g_mode == DvfsMode::PREDICTIVE) {
+                std::snprintf(fsm_buf, sizeof(fsm_buf), "state=%s miss_count=%d hit_count=%d",
+                              stateToString(s.state), s.miss_count, s.hit_count);
+            } else {
+                std::snprintf(fsm_buf, sizeof(fsm_buf), "mode=%s", modeToString(g_mode));
+            }
+            const double now_ms = Log::nowMs();
+            const double now_uJ = power_energy_now_uJ();
+            const double win_power_mW = (now_ms > win_start_ms)
+                ? (now_uJ - win_energy_start_uJ) / (now_ms - win_start_ms) : 0.0;   // uJ/ms = mW
+            win_energy_start_uJ = now_uJ;
+            win_start_ms = now_ms;
+            char buf[440];
             std::snprintf(buf, sizeof(buf),
                 "frames %d-%d  detect='%s'(%.2f)  vision_lat avg=%.1fms max=%.1fms  overrun=%d  "
-                "requests=%d  | state=%s miss_count=%d hit_count=%d  "
-                "| freq up=%d(early %d) down=%d(false_alarm %d) gpu=%s  ring=%zu",
+                "requests=%d  | %s  "
+                "| freq up=%d(early %d) down=%d(false_alarm %d) gpu=%s  ring=%zu  | power avg=%.1fmW",
                 frame_count + 1 - win_frames, frame_count, last_detect.c_str(), last_score,
                 win_lat_sum / win_frames, win_lat_max, win_overruns, win_requests,
-                stateToString(s.state), s.miss_count, s.hit_count,
+                fsm_buf,
                 c.up, c.early_up, c.down, c.false_alarm_down,
-                GpuFreq::mhz(GpuFreq::current()).c_str(), vision_ring.size());
+                GpuFreq::mhz(GpuFreq::current()).c_str(), vision_ring.size(), win_power_mW);
             Log::event("VISION", buf);
             win_lat_sum = win_lat_max = 0.0;
             win_frames = win_requests = win_overruns = 0;
@@ -365,25 +385,64 @@ void visionThreadFunc() {
     vision_ring.close();
 }
 
-int main() {
+// "./dvfs_log.csv" + "max_freq" -> "./dvfs_log_max_freq.csv"
+static std::string withModeSuffix(const std::string& path, DvfsMode mode) {
+    if (path.empty()) return path;
+    size_t slash = path.find_last_of('/');
+    size_t dot = path.find_last_of('.');
+    std::string suffix = std::string("_") + modeToString(mode);
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return path + suffix;
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+static void printUsage(const char* prog) {
+    std::fprintf(stderr,
+        "usage: sudo %s [--mode predictive|max_freq|reactive_only]\n"
+        "  predictive    : Predictive-DVFS (default)\n"
+        "  max_freq      : baseline 1, GPU fixed at max frequency\n"
+        "  reactive_only : baseline 2, no early scaling (up on LLM request, down on LLM end)\n",
+        prog);
+}
+
+int main(int argc, char** argv) {
+    // 자식 프로세스가 죽은 뒤 pipe 에 쓰면 SIGPIPE 로 전체가 종료되는 것을 방지
     signal(SIGPIPE, SIG_IGN);
-    
-    // Logger
-    if (!Log::open()) {
-        std::cerr << "cannot open log file " << DVFS_LOG_PATH << "\n";
+
+    // 실행 모드 파싱
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if ((a == "--mode" || a == "-m") && i + 1 < argc) {
+            if (!parseMode(argv[++i], g_mode)) { printUsage(argv[0]); return 1; }
+        } else if (a.rfind("--mode=", 0) == 0) {
+            if (!parseMode(a.substr(7), g_mode)) { printUsage(argv[0]); return 1; }
+        } else if (a == "-h" || a == "--help") {
+            printUsage(argv[0]); return 0;
+        } else {
+            printUsage(argv[0]); return 1;
+        }
+    }
+
+    // 모드별 로그 파일 분리 (결과 덮어쓰기 방지)
+    const std::string log_path   = withModeSuffix(DVFS_LOG_PATH, g_mode);
+    const std::string trace_path = withModeSuffix(POWER_TRACE_PATH, g_mode);
+    set_power_trace_path(trace_path);
+
+    if (!Log::open(log_path)) {
+        std::cerr << "cannot open log file " << log_path << "\n";
         return 1;
     }
-    Log::event("SYSTEM", "Starting VLA Predictive-DVFS Framework (MISS_THRESHOLD=" +
-               std::to_string(PredictiveDVFS::MISS_THRESHOLD) + ", HIT_THRESHOLD=" +
-               std::to_string(PredictiveDVFS::HIT_THRESHOLD) + ", log=" DVFS_LOG_PATH ")");
+    Log::event("SYSTEM", std::string("Starting VLA Predictive-DVFS Framework  mode=") + modeToString(g_mode) +
+               "  (MISS_THRESHOLD=" + std::to_string(PredictiveDVFS::MISS_THRESHOLD) +
+               ", HIT_THRESHOLD=" + std::to_string(PredictiveDVFS::HIT_THRESHOLD) +
+               ")  log=" + log_path + "  power_trace=" + (trace_path.empty() ? "off" : trace_path));
 
-    // GpuFreq init
-    if (!GpuFreq::init()) {
+    dvfsController.setMode(g_mode);
+    if (!GpuFreq::init(g_mode)) {
         std::cerr << "GPU DVFS init failed. Run with sudo and check " GPU_DEVFREQ_PATH "\n";
         return 1;
     }
 
-    // llama.cpp binary init
+    // 쓰레드 생성 전에 fork (멀티쓰레드 상태에서의 fork 회피) + 모델 로드 완료 대기
     LlmProcess llm;
     if (!llm.start({MOTION_PLAN_BIN, "-m", LLM_MODEL_PATH})) {
         std::cerr << "Failed to start motion-plan process.\n";
@@ -391,7 +450,12 @@ int main() {
         return 1;
     }
 
-    // 2 threads init
+    // power start (모델 로드 이후 ~ 테스트벤치 종료까지 측정)
+    std::thread power_thread;
+    double consumed_uJ = 0.0;
+    bool power_ok = set_power_measure(&consumed_uJ, &power_thread);
+    if (!power_ok) Log::event("POWER", "power measurement disabled (continue without it)");
+
     std::thread llm_thread(llmThreadFunc, std::ref(llm));
     std::thread vision_thread(visionThreadFunc);
 
@@ -401,7 +465,10 @@ int main() {
     llm.stop();
     GpuFreq::releaseAll();
 
-    // Logger
+    // power end
+    if (power_ok) get_power_measure(&consumed_uJ, &power_thread);
+
+    // 최종 요약
     auto s = dvfsController.snapshot();
     auto c = GpuFreq::totalCounters();
     char buf[400];
@@ -413,10 +480,20 @@ int main() {
         llm_stats.count ? llm_stats.sum_wait_ms / llm_stats.count : 0.0,
         vision_ring.dropped());
     Log::event("SUMMARY", buf);
-    std::snprintf(buf, sizeof(buf),
-        "freq up=%d (early %d) down=%d (false_alarm %d)  FSM transitions=%d  final state=%s",
-        c.up, c.early_up, c.down, c.false_alarm_down, s.transitions, stateToString(s.state));
+    if (g_mode == DvfsMode::PREDICTIVE) {
+        std::snprintf(buf, sizeof(buf),
+            "mode=%s  freq up=%d (early %d) down=%d (false_alarm %d)  FSM transitions=%d  final state=%s",
+            modeToString(g_mode), c.up, c.early_up, c.down, c.false_alarm_down,
+            s.transitions, stateToString(s.state));
+    } else {
+        std::snprintf(buf, sizeof(buf), "mode=%s  freq up=%d down=%d",
+                      modeToString(g_mode), c.up, c.down);
+    }
     Log::event("SUMMARY", buf);
+    if (power_ok) {
+        std::snprintf(buf, sizeof(buf), "energy=%.3f J (%.0f uJ)", consumed_uJ / 1e6, consumed_uJ);
+        Log::event("SUMMARY", buf);
+    }
     Log::event("SYSTEM", "System Terminated.");
     Log::close();
     return 0;

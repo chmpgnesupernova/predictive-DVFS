@@ -29,6 +29,12 @@
  *                              (= HIT 사이 간격이 25 프레임 이내일 때만 "연속 HIT" 로 인정.
  *                                 MISS 한 번에 hit_count 를 0 으로 하면 1초 주기 환경에서
  *                                 NOT_TAKEN → TAKEN 전이가 불가능하므로)
+ *
+ * 실험 모드 (DvfsMode)
+ *  - PREDICTIVE    : 제안 기법. FSM 기반 early scaling + reactive scaling + LLM_END 즉시 down
+ *  - MAX_FREQ      : baseline 1. GPU 를 항상 최대 주파수(HIGH_HZ)로 고정. 스케일링 없음
+ *  - REACTIVE_ONLY : baseline 2. early scaling 없음. HIT(LLM request) 시점에 up,
+ *                    LLM_END_MARKER 수신 즉시 down (FSM 미사용)
  */
 
 // 보드에 맞게 확인할 것: ls /sys/class/devfreq/
@@ -36,9 +42,30 @@
 #define GPU_DEVFREQ_PATH "/sys/class/devfreq/17000000.gpu"
 #endif
 
+// 실험 모드
+enum class DvfsMode {
+    PREDICTIVE,
+    MAX_FREQ,
+    REACTIVE_ONLY
+};
+
+inline const char* modeToString(DvfsMode m) {
+    switch (m) {
+        case DvfsMode::PREDICTIVE:    return "predictive";
+        case DvfsMode::MAX_FREQ:      return "max_freq";
+        case DvfsMode::REACTIVE_ONLY: return "reactive_only";
+    }
+    return "unknown";
+}
+
+inline bool parseMode(const std::string& s, DvfsMode& out) {
+    if (s == "predictive")    { out = DvfsMode::PREDICTIVE;    return true; }
+    if (s == "max_freq")      { out = DvfsMode::MAX_FREQ;      return true; }
+    if (s == "reactive_only") { out = DvfsMode::REACTIVE_ONLY; return true; }
+    return false;
+}
+
 // 주파수 변경 원인
-// chmpnov:
-// Reason 을 추가한 이유는? 필요한가?
 enum class FreqReason {
     INIT,              // 시작 시 LOW 로 초기화
     EARLY_UP,          // TAKEN: 비전 추론 시작과 동시에 선제적 up        (매 프레임 반복 → 파일만)
@@ -87,16 +114,25 @@ public:
 
     using Counters = FreqCounters;
 
-    static bool init() {
+    // MAX_FREQ: HIGH 로 시작 후 고정, 그 외: LOW 로 시작
+    static bool init(DvfsMode mode = DvfsMode::PREDICTIVE) {
         std::lock_guard<std::mutex> lock(mtx_);
+        mode_ = mode;
         if (!writeSysfs(GPU_DEVFREQ_PATH "/governor", "userspace")) return false;
         cur_hz_ = -1;
-        setLocked(LOW_HZ, FreqReason::INIT);
-        return cur_hz_ == LOW_HZ;
+        const long init_hz = (mode_ == DvfsMode::MAX_FREQ) ? HIGH_HZ : LOW_HZ;
+        setLocked(init_hz, FreqReason::INIT);
+        return cur_hz_ == init_hz;
+    }
+
+    static DvfsMode mode() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return mode_;
     }
 
     static void set(long hz, FreqReason reason) {
         std::lock_guard<std::mutex> lock(mtx_);
+        if (mode_ == DvfsMode::MAX_FREQ) return;          // 고정 주파수
         if (hz < cur_hz_ && pending_ > 0) {
             if (DVFS_VERBOSE) {
                 Log::fileOnly("FREQ_BLOCKED", std::string(reasonToString(reason)) +
@@ -123,6 +159,7 @@ public:
     static void release() {
         std::lock_guard<std::mutex> lock(mtx_);
         if (pending_ > 0) --pending_;
+        if (mode_ == DvfsMode::MAX_FREQ) return;          // 고정 주파수
         if (pending_ == 0) {
             setLocked(LOW_HZ, FreqReason::LLM_END_DOWN);
         } else {
@@ -210,6 +247,7 @@ private:
     inline static std::mutex mtx_;
     inline static long cur_hz_ = -1;
     inline static int pending_ = 0;
+    inline static DvfsMode mode_ = DvfsMode::PREDICTIVE;
     inline static Counters window_{};
     inline static Counters total_{};
 };
@@ -240,9 +278,24 @@ public:
         int transitions;
     };
 
+    void setMode(DvfsMode m) {
+        std::lock_guard<std::mutex> lock(mtx);
+        mode = m;
+    }
+
+    // FSM 을 사용하는 모드인지 (baseline 은 FSM 미사용)
+    bool usesFsm() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return mode == DvfsMode::PREDICTIVE;
+    }
+
     // 비전 추론 직전에 호출
     void scaleFrequencyEarly() {
         std::lock_guard<std::mutex> lock(mtx);
+        if (mode != DvfsMode::PREDICTIVE) {       // baseline: early scaling 없음
+            early_scale = false;
+            return;
+        }
         if (state == TAKEN) {
             early_t_ms = Log::nowMs();
             GpuFreq::set(GpuFreq::HIGH_HZ, FreqReason::EARLY_UP);
@@ -255,6 +308,18 @@ public:
     // middleware 판단 직후 호출 (is_hit = LLM request 여부)
     void scaleFrequencyReactive(bool is_hit) {
         std::lock_guard<std::mutex> lock(mtx);
+
+        if (mode == DvfsMode::MAX_FREQ) {         // baseline 1: 스케일링 없음
+            if (is_hit) Log::event("FSM", "HIT  mode=max_freq (fixed " + GpuFreq::mhz(GpuFreq::HIGH_HZ) + ")");
+            return;
+        }
+        if (mode == DvfsMode::REACTIVE_ONLY) {    // baseline 2: request 시점에만 up
+            if (is_hit) {
+                GpuFreq::set(GpuFreq::HIGH_HZ, FreqReason::REACTIVE_UP);
+                Log::event("FSM", "HIT  mode=reactive_only scaling=REACTIVE");
+            }
+            return;
+        }
 
         if (!early_scale && is_hit) {
             GpuFreq::set(GpuFreq::HIGH_HZ, FreqReason::REACTIVE_UP);
@@ -300,6 +365,7 @@ public:
     }
 
 private:
+    DvfsMode mode = DvfsMode::PREDICTIVE;
     FSMState state = TAKEN;
     std::mutex mtx;
     bool early_scale = false;
